@@ -1,161 +1,17 @@
-import sqlite3
 import streamlit as st
 import pandas as pd
+from supabase import create_client, Client
 
 
-# --- DATABASE SETUP (SMART SELF-HEALING SCHEMA) ---
-def init_db():
-    conn = sqlite3.connect("hockey_squads.db", check_same_thread=False)
-    cursor = conn.cursor()
-
-    # Teams table
-    cursor.execute("""
-                   CREATE TABLE IF NOT EXISTS teams
-                   (
-                       team_id
-                       INTEGER
-                       PRIMARY
-                       KEY
-                       AUTOINCREMENT,
-                       name
-                       TEXT
-                       NOT
-                       NULL
-                       UNIQUE,
-                       city
-                       TEXT
-                       NOT
-                       NULL
-                   )
-                   """)
-
-    # Check if 'players' table has an old/incompatible schema (like old 'team_name' or missing 'team_id')
-    cursor.execute("PRAGMA table_info(players)")
-    existing_cols = [col[1] for col in cursor.fetchall()]
-
-    if existing_cols and (
-            "team_name" in existing_cols or "team_id" not in existing_cols or "odds" not in existing_cols):
-        # Drop and cleanly recreate the players table to match the new schema
-        cursor.execute("DROP TABLE IF EXISTS players")
-
-    # Correct Players table structure
-    cursor.execute("""
-                   CREATE TABLE IF NOT EXISTS players
-                   (
-                       player_id
-                       INTEGER
-                       PRIMARY
-                       KEY
-                       AUTOINCREMENT,
-                       team_id
-                       INTEGER,
-                       name
-                       TEXT
-                       NOT
-                       NULL,
-                       position
-                       TEXT,
-                       jersey_number
-                       INTEGER,
-                       goals
-                       INTEGER
-                       DEFAULT
-                       0,
-                       assists
-                       INTEGER
-                       DEFAULT
-                       0,
-                       odds
-                       REAL
-                       DEFAULT
-                       0.00,
-                       FOREIGN
-                       KEY
-                   (
-                       team_id
-                   ) REFERENCES teams
-                   (
-                       team_id
-                   )
-                       )
-                   """)
-
-    # Fixtures table
-    cursor.execute("""
-                   CREATE TABLE IF NOT EXISTS fixtures
-                   (
-                       fixture_id
-                       INTEGER
-                       PRIMARY
-                       KEY
-                       AUTOINCREMENT,
-                       team_id
-                       INTEGER,
-                       opponent
-                       TEXT
-                       NOT
-                       NULL,
-                       location
-                       TEXT
-                       NOT
-                       NULL,    -- 'H' for Home, 'A' for Away
-                       match_order
-                       INTEGER, -- 1 to 6
-                       FOREIGN
-                       KEY
-                   (
-                       team_id
-                   ) REFERENCES teams
-                   (
-                       team_id
-                   )
-                       )
-                   """)
-
-    # Pre-populate exact Norwegian EHL teams
-    teams_data = [
-        ("Frisk Asker", "Asker"),
-        ("Lillehammer", "Lillehammer"),
-        ("Narvik", "Narvik"),
-        ("Nidaros", "Trondheim"),
-        ("Ringerike", "Hønefoss"),
-        ("Stavanger Oilers", "Stavanger"),
-        ("Stjernen", "Fredrikstad"),
-        ("Storhamar", "Hamar"),
-        ("Vålerenga", "Oslo")
-    ]
-    cursor.executemany("INSERT OR IGNORE INTO teams (name, city) VALUES (?, ?)", teams_data)
-    conn.commit()
-
-    # Pre-populate 6 upcoming sample fixtures for Storhamar
-    cursor.execute("SELECT team_id FROM teams WHERE name = 'Storhamar'")
-    row = cursor.fetchone()
-    if row:
-        storhamar_id = row[0]
-        sample_fixtures = [
-            (storhamar_id, "Nidaros", "A", 1),
-            (storhamar_id, "Lillehammer", "H", 2),
-            (storhamar_id, "Vålerenga", "A", 3),
-            (storhamar_id, "Stavanger Oilers", "H", 4),
-            (storhamar_id, "Frisk Asker", "A", 5),
-            (storhamar_id, "Stjernen", "H", 6),
-        ]
-        cursor.execute("DELETE FROM fixtures WHERE team_id = ?", (storhamar_id,))
-        cursor.executemany("""
-                           INSERT INTO fixtures (team_id, opponent, location, match_order)
-                           VALUES (?, ?, ?, ?)
-                           """, sample_fixtures)
-        conn.commit()
-
-    conn.close()
+# --- SUPABASE CLIENT SETUP ---
+@st.cache_resource
+def init_supabase() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
 
-init_db()
-
-
-def get_connection():
-    return sqlite3.connect("hockey_squads.db", check_same_thread=False)
-
+supabase = init_supabase()
 
 st.title("🏒 EHL Squad Manager")
 
@@ -164,57 +20,77 @@ menu = st.sidebar.selectbox("Navigation",
                             ["View Squads & Stats", "Add Player", "Update Player Stats & Odds", "Manage Fixtures",
                              "🔍 DB Debug View"])
 
-# Fetch team mapping
-conn = get_connection()
-teams_df = pd.read_sql("SELECT team_id, name FROM teams ORDER BY name ASC", conn)
-team_dict = dict(zip(teams_df["name"], teams_df["team_id"]))
-conn.close()
+# Fetch teams from Supabase
+teams_res = supabase.table("teams").select("team_id, name").order("name").execute()
+teams_data = teams_res.data
+team_dict = {t["name"]: t["team_id"] for t in teams_data} if teams_data else {}
+
+# If teams table is empty on first run, seed initial teams
+if not team_dict:
+    default_teams = [
+        {"name": "Frisk Asker", "city": "Asker"},
+        {"name": "Lillehammer", "city": "Lillehammer"},
+        {"name": "Narvik", "city": "Narvik"},
+        {"name": "Nidaros", "city": "Trondheim"},
+        {"name": "Ringerike", "city": "Hønefoss"},
+        {"name": "Stavanger Oilers", "city": "Stavanger"},
+        {"name": "Stjernen", "city": "Fredrikstad"},
+        {"name": "Storhamar", "city": "Hamar"},
+        {"name": "Vålerenga", "city": "Oslo"}
+    ]
+    supabase.table("teams").upsert(default_teams).execute()
+    teams_res = supabase.table("teams").select("team_id, name").order("name").execute()
+    team_dict = {t["name"]: t["team_id"] for t in teams_res.data}
 
 # --- PAGE 1: VIEW SQUADS, ODDS & FIXTURES ---
 if menu == "View Squads & Stats":
     st.header("Team Rosters")
 
-    selected_team = st.selectbox("Select a Team", list(team_dict.keys()))
-    t_id = team_dict[selected_team]
-
-    conn = get_connection()
-    # Fetch next 6 fixtures
-    fixtures_df = pd.read_sql("""
-                              SELECT opponent || ' (' || location || ')' AS fixture, match_order
-                              FROM fixtures
-                              WHERE team_id = ?
-                              ORDER BY match_order ASC LIMIT 6
-                              """, conn, params=(t_id,))
-
-    # Fetch players with Odds
-    players_df = pd.read_sql("""
-                             SELECT player_id,
-                                    name          AS "Player Name",
-                                    position      AS "Position",
-                                    jersey_number AS "Jersey #",
-                                    goals         AS "Goals",
-                                    assists       AS "Assists",
-                                    odds          AS "Odds to Score"
-                             FROM players
-                             WHERE team_id = ?
-                             """, conn, params=(t_id,))
-    conn.close()
-
-    if players_df.empty:
-        st.info(f"No players registered for {selected_team} yet.")
+    if not team_dict:
+        st.warning("No teams found. Please check your Supabase connection.")
     else:
-        players_df["Odds to Score"] = players_df["Odds to Score"].apply(lambda x: f"{x:.2f}" if x > 0 else "")
+        selected_team = st.selectbox("Select a Team", list(team_dict.keys()))
+        t_id = team_dict[selected_team]
 
-        # Append 6 match columns after Odds
-        for i in range(1, 7):
-            match_row = fixtures_df[fixtures_df['match_order'] == i]
-            col_label = f"Match {i}"
-            if not match_row.empty:
-                players_df[col_label] = match_row.iloc[0]['fixture']
-            else:
-                players_df[col_label] = "-"
+        # Fetch fixtures for this team
+        fix_res = supabase.table("fixtures").select("opponent, location, match_order").eq("team_id", t_id).order(
+            "match_order").execute()
+        fixtures_df = pd.DataFrame(fix_res.data)
 
-        st.dataframe(players_df, use_container_width=True, hide_index=True)
+        # Fetch players for this team
+        p_res = supabase.table("players").select("player_id, name, position, jersey_number, goals, assists, odds").eq(
+            "team_id", t_id).execute()
+        players_df = pd.DataFrame(p_res.data)
+
+        if players_df.empty:
+            st.info(f"No players registered for {selected_team} yet.")
+        else:
+            # Rename columns to match display format
+            players_df = players_df.rename(columns={
+                "name": "Player Name",
+                "position": "Position",
+                "jersey_number": "Jersey #",
+                "goals": "Goals",
+                "assists": "Assists",
+                "odds": "Odds to Score"
+            })
+
+            players_df["Odds to Score"] = players_df["Odds to Score"].apply(lambda x: f"{x:.2f}" if x and x > 0 else "")
+
+            # Append 6 match columns
+            for i in range(1, 7):
+                col_label = f"Match {i}"
+                if not fixtures_df.empty and i in fixtures_df['match_order'].values:
+                    match_row = fixtures_df[fixtures_df['match_order'] == i].iloc[0]
+                    players_df[col_label] = f"{match_row['opponent']} ({match_row['location']})"
+                else:
+                    players_df[col_label] = "-"
+
+            # Drop internal ID column if present
+            if "player_id" in players_df.columns:
+                players_df = players_df.drop(columns=["player_id"])
+
+            st.dataframe(players_df, use_container_width=True, hide_index=True)
 
 # --- PAGE 2: ADD PLAYER ---
 elif menu == "Add Player":
@@ -235,14 +111,15 @@ elif menu == "Add Player":
                 st.error("Please type a player name before submitting!")
             else:
                 t_id = team_dict[selected_team]
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                               INSERT INTO players (team_id, name, position, jersey_number, goals, assists, odds)
-                               VALUES (?, ?, ?, ?, 0, 0, ?)
-                               """, (t_id, player_name, position, jersey_number, initial_odds))
-                conn.commit()
-                conn.close()
+                supabase.table("players").insert({
+                    "team_id": t_id,
+                    "name": player_name,
+                    "position": position,
+                    "jersey_number": int(jersey_number),
+                    "goals": 0,
+                    "assists": 0,
+                    "odds": float(initial_odds)
+                }).execute()
                 st.success(f"Successfully added {player_name} to {selected_team}!")
 
 # --- PAGE 3: UPDATE STATS & ODDS ---
@@ -252,10 +129,8 @@ elif menu == "Update Player Stats & Odds":
     selected_team = st.selectbox("Select Team", list(team_dict.keys()))
     t_id = team_dict[selected_team]
 
-    conn = get_connection()
-    players_df = pd.read_sql("SELECT player_id, name, goals, assists, odds FROM players WHERE team_id = ?", conn,
-                             params=(t_id,))
-    conn.close()
+    p_res = supabase.table("players").select("player_id, name, goals, assists, odds").eq("team_id", t_id).execute()
+    players_df = pd.DataFrame(p_res.data)
 
     if players_df.empty:
         st.warning("No players found in this team to update.")
@@ -275,17 +150,11 @@ elif menu == "Update Player Stats & Odds":
             update_submitted = st.form_submit_button("Save Changes")
 
             if update_submitted:
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                               UPDATE players
-                               SET goals   = ?,
-                                   assists = ?,
-                                   odds    = ?
-                               WHERE player_id = ?
-                               """, (new_goals, new_assists, new_odds, p_id))
-                conn.commit()
-                conn.close()
+                supabase.table("players").update({
+                    "goals": int(new_goals),
+                    "assists": int(new_assists),
+                    "odds": float(new_odds)
+                }).eq("player_id", p_id).execute()
                 st.success(f"Updated stats and odds for {selected_player}!")
 
 # --- PAGE 4: MANAGE FIXTURES ---
@@ -294,7 +163,6 @@ elif menu == "Manage Fixtures":
 
     selected_team = st.selectbox("Select Team", list(team_dict.keys()))
     t_id = team_dict[selected_team]
-
     other_teams = [t for t in team_dict.keys() if t != selected_team]
 
     with st.form("add_fixture_form", clear_on_submit=True):
@@ -306,38 +174,23 @@ elif menu == "Manage Fixtures":
 
         if add_fixture:
             loc_code = "H" if "Home" in location else "A"
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM fixtures WHERE team_id = ? AND match_order = ?", (t_id, match_order))
-            cursor.execute("""
-                           INSERT INTO fixtures (team_id, opponent, location, match_order)
-                           VALUES (?, ?, ?, ?)
-                           """, (t_id, opponent, loc_code, match_order))
-            conn.commit()
-            conn.close()
+            # Remove existing fixture for this slot if it exists
+            supabase.table("fixtures").delete().eq("team_id", t_id).eq("match_order", int(match_order)).execute()
+            # Insert new fixture
+            supabase.table("fixtures").insert({
+                "team_id": t_id,
+                "opponent": opponent,
+                "location": loc_code,
+                "match_order": int(match_order)
+            }).execute()
             st.success(f"Set Match #{match_order} for {selected_team} vs {opponent} ({loc_code})!")
 
 # --- PAGE 5: DEBUG VIEW ---
 elif menu == "🔍 DB Debug View":
-    st.header("Raw Database Contents")
-
-    conn = get_connection()
-    raw_df = pd.read_sql("""
-                         SELECT P.player_id,
-                                T.name AS team_name,
-                                P.team_id,
-                                P.name AS player_name,
-                                P.position,
-                                P.jersey_number,
-                                P.goals,
-                                P.assists,
-                                P.odds
-                         FROM players P
-                                  LEFT JOIN teams T ON P.team_id = T.team_id
-                         """, conn)
-    conn.close()
-
-    if raw_df.empty:
+    st.header("Raw Supabase Contents")
+    p_res = supabase.table("players").select("*, teams(name)").execute()
+    debug_df = pd.DataFrame(p_res.data)
+    if debug_df.empty:
         st.warning("The players table is currently empty.")
     else:
-        st.dataframe(raw_df, use_container_width=True, hide_index=True)
+        st.dataframe(debug_df, use_container_width=True, hide_index=True)
